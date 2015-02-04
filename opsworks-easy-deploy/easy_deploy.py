@@ -33,17 +33,21 @@ class Operation(object):
         }
         self.stack_name = None
         self.layer_name = None
+        self.layers     = None
         self.deploy_timeout = None
         self._stack_id = None
         self._layer_id = None
-
+        self.migrate_database = 'false'
         self.pre_deployment_hooks = []
         self.post_deployment_hooks = []
 
-    def init(self, stack_name, timeout=None, layer_name=None):
+    def init(self, stack_name, timeout=None, layer_name=None, layers=None, migrate_database='false'):
         self.stack_name = stack_name
         self.layer_name = layer_name
         self.deploy_timeout = timeout
+        self.migrate_database = migrate_database
+        if layers is not None:
+            self.layers = str(layers).split(',')
 
     @property
     def stack_id(self):
@@ -62,16 +66,19 @@ class Operation(object):
     @property
     def layer_id(self):
         if self._layer_id is None:
-            layers = self._make_api_call('opsworks', 'DescribeLayers', stack_id=self.stack_id)['Layers']
-            for each_layer in layers:
-                layer_id = each_layer['LayerId']
-                if self.layer_name == each_layer['Name'].lower():
-                    self._layer_id = layer_id
-                    break
-            else:
-                log("No Layer found with name {0} in stack {1}.  Aborting".format(self.layer_name, self.stack_name))
-                sys.exit(1)
+            self._layer_id = self.get_layer_id(self.layer_name)
         return self._layer_id
+
+    def get_layer_id(self, layer_name):
+        layers = self._make_api_call('opsworks', 'DescribeLayers', stack_id=self.stack_id)['Layers']
+        for each_layer in layers:
+            layer_id = each_layer['LayerId']
+            if layer_name == each_layer['Name'].lower():
+                return layer_id
+                break
+        else:
+            log("No Layer found with name {0} in stack {1}.  Aborting".format(self.layer_name, self.stack_name))
+            sys.exit(1)
 
     def layer_at_once(self, comment, exclude_hosts=None):
         all_instances = self._make_api_call('opsworks', 'DescribeInstances', layer_id=self.layer_id)
@@ -86,22 +93,42 @@ class Operation(object):
         self._deploy_to(instance_ids=deployment_instance_ids, name="{0} instances".format(self.layer_name), comment=comment)
 
     def layer_rolling(self, comment):
-        load_balancer_name = self._get_opsworks_elb_name()
+        if self.layers is not None:
+            for layer in self.layers:
+                layer_id = self.get_layer_id(layer)
+                load_balancer_name = self._get_opsworks_elb_name(layer_id)
 
-        if load_balancer_name is not None:
-            self.pre_deployment_hooks.append(self._remove_instance_from_elb)
-            self.post_deployment_hooks.append(self._add_instance_to_elb)
+                if load_balancer_name is not None:
+                    self.pre_deployment_hooks.append(self._remove_instance_from_elb)
+                    self.post_deployment_hooks.append(self._add_instance_to_elb)
 
-        all_instances = self._make_api_call('opsworks', 'DescribeInstances', layer_id=self.layer_id)
-        for each in all_instances['Instances']:
-            if each['Status'] != 'online':
-                continue
+                    all_instances = self._make_api_call('opsworks', 'DescribeInstances', layer_id=layer_id)
+                    for each in all_instances['Instances']:
+                        if each['Status'] != 'online':
+                            continue
 
-            hostname = each['Hostname']
-            instance_id = each['InstanceId']
-            ec2_instance_id = each['Ec2InstanceId']
+                        self.single_instance(each['Hostname'], each['InstanceId'], each['Ec2InstanceId'], comment, load_balancer_name)
+                else:
+                    self.pre_deployment_hooks = []
+                    self.post_deployment_hooks = []
+                    self._layer_id = self.get_layer_id(layer)
+                    self.layer_at_once(comment)
+        else:
+            load_balancer_name = self._get_opsworks_elb_name(self.layer_id)
 
-            self._deploy_to(instance_ids=[instance_id], name=hostname, comment=comment, load_balancer_name=load_balancer_name, ec2_instance_id=ec2_instance_id)
+            if load_balancer_name is not None:
+                self.pre_deployment_hooks.append(self._remove_instance_from_elb)
+                self.post_deployment_hooks.append(self._add_instance_to_elb)
+
+                all_instances = self._make_api_call('opsworks', 'DescribeInstances', layer_id=self.layer_id)
+                for each in all_instances['Instances']:
+                    if each['Status'] != 'online':
+                        continue
+
+                    self.single_instance(each['Hostname'], each['InstanceId'], each['Ec2InstanceId'], comment, load_balancer_name)
+
+    def single_instance(self, hostname, instance_id, ec2_instance_id, comment, load_balancer_name):
+        self._deploy_to(instance_ids=[instance_id], name=hostname, comment=comment, load_balancer_name=load_balancer_name, ec2_instance_id=ec2_instance_id)
 
     def instances_at_once(self, host_names, comment):
         all_instances = self._make_api_call('opsworks', 'DescribeInstances', stack_id=self.stack_id)
@@ -122,12 +149,12 @@ class Operation(object):
         log("Added {0} to ELB {1}.  Sleeping for {2} seconds for it to be online".format(hostname, load_balancer_name, instance_healthy_wait))
         time.sleep(instance_healthy_wait)
 
-    def _get_opsworks_elb_name(self):
+    def _get_opsworks_elb_name(self, layer_id):
         """
         Get an OpsWorks ELB Name of the layer id in the stack if is associated with the layer
         :return: Elastic Load Balancer name if associated with the layer, otherwise None
         """
-        elbs = self._make_api_call('opsworks', 'DescribeElasticLoadBalancers', layer_ids=[self.layer_id])
+        elbs = self._make_api_call('opsworks', 'DescribeElasticLoadBalancers', layer_ids=[layer_id])
         if len(elbs['ElasticLoadBalancers']) > 0:
             return elbs['ElasticLoadBalancers'][0]['ElasticLoadBalancerName']
         else:
@@ -331,7 +358,7 @@ class Deploy(Operation):
             'stack_id': self.stack_id,
             'app_id': self.application_id,
             'instance_ids': instance_ids,
-            'command': {'Name': self.command},
+            'command': {'Name': self.command, 'Args': {'migrate': [self.migrate_database]}},
             'comment': comment
         }
 
@@ -390,12 +417,14 @@ def all(ctx, stack_name, layer_name, exclude_hosts, comment, timeout):
 @cli.command(help='Rolling execution of operation to all hosts in the layer')
 @click.option('--stack-name', type=click.STRING, required=True, help='OpsWorks Stack name')
 @click.option('--layer-name', help='Layer to deploy application to')
+@click.option('--layers', help='Comma separated list of layers to deploy to')
 @click.option('--comment', help='Deployment message')
 @click.option('--timeout', default=None, help='Deployment timeout')
+@click.option('--migrate-database', default='false', help='Migrate database')
 @click.pass_context
-def rolling(ctx, stack_name, layer_name, comment, timeout):
+def rolling(ctx, stack_name, layer_name, comment, timeout, layers, migrate_database):
     operation = ctx.obj['OPERATION']
-    operation.init(stack_name=stack_name, layer_name=layer_name, timeout=timeout)
+    operation.init(stack_name=stack_name, layer_name=layer_name, layers=layers, timeout=timeout, migrate_database=migrate_database)
     operation.layer_rolling(comment=comment)
 
 
